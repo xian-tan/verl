@@ -6,10 +6,15 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export SWANLAB_API_KEY=yGRB9Af71SSb9z3GtnvDf
 
 gsm8k_train_path=../data/gsm8k/train.parquet
+math_train_path=../data/math/train.parquet
+math_dapo_train_path=../data/math_dapo/sample_train.parquet
 gsm8k_test_path=../data/gsm8k/test.parquet
+math_test_path=../data/math/test.parquet
+math_dapo_test_path=../data/math_dapo/sample_test.parquet
 
-train_files="['$gsm8k_train_path']"
-test_files="['$gsm8k_test_path']"
+# train_files="['$math_dapo_train_path']"
+train_files="['$gsm8k_train_path', '$math_train_path', '$math_dapo_train_path']"
+test_files="['$gsm8k_test_path', '$math_test_path', '$math_dapo_test_path']"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -42,10 +47,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","swanlab"]' \
-    trainer.project_name='verl_grpo_example_gsm8k_math' \
+    trainer.project_name='verl_grpo_math_mix' \
     trainer.experiment_name='qwen2-3b_math_grpo' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=5 $@
+    trainer.total_epochs=10 $@
