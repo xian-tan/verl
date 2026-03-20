@@ -43,7 +43,9 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    collect_gdd_samples,
     compute_data_metrics,
+    compute_epoch_gdd,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -199,6 +201,8 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # 传递 norm_adv_by_std_in_grpo 给 difficulty-aware estimator
+        adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -304,6 +308,11 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+        # ===== GDD（Gradient Difficulty Distribution）epoch 级别累加器 =====
+        # 每个 step 收集 per-sample 数据，epoch 结束时统一计算 GDD 指标
+        self.gdd_accumulator = []
+        print("[GDD] Epoch-level GDD accumulator initialized.")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1275,6 +1284,10 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            # 在 epoch 开始时清空 GDD 累加器
+            self.gdd_accumulator = []
+            print(f"[GDD] Epoch {epoch} started, accumulator cleared.")
+
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1568,6 +1581,16 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+
+                # ===== GDD: 收集当前 step 的 per-sample 数据 =====
+                try:
+                    gdd_samples = collect_gdd_samples(batch)
+                    self.gdd_accumulator.extend(gdd_samples)
+                    if self.global_steps % 10 == 0:  # 每10步打印一次调试信息
+                        print(f"[GDD] Step {self.global_steps}: collected {len(gdd_samples)} samples, "
+                              f"accumulator total: {len(self.gdd_accumulator)}")
+                except Exception as e:
+                    print(f"[GDD] Warning: failed to collect GDD samples at step {self.global_steps}: {e}")
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
@@ -1601,8 +1624,26 @@ class RayPPOTrainer:
                     progress_bar.close()
                     return
 
+                # ===== GDD: 在 epoch 最后一个 batch 时计算并记录 epoch-level GDD =====
+                # 检测方法: 当前 step 是否为 dataloader 的最后一个 batch
+                is_epoch_end = (self.global_steps - 1) % len(self.train_dataloader) == 0 and self.global_steps > 1
+                if is_epoch_end or is_last_step:
+                    if len(self.gdd_accumulator) > 0:
+                        try:
+                            gdd_metrics = compute_epoch_gdd(self.gdd_accumulator)
+                            logger.log(data=gdd_metrics, step=self.global_steps - 1)
+                            print(f"[GDD] Epoch {epoch} GDD computed and logged. "
+                                  f"Total samples: {len(self.gdd_accumulator)}")
+                            # 打印 GDD 摘要
+                            for k, v in sorted(gdd_metrics.items()):
+                                if 'count' in k or 'ratio' in k or 'gdd' in k:
+                                    print(f"  [GDD]   {k}: {v:.4f}")
+                        except Exception as e:
+                            print(f"[GDD] Warning: failed to compute epoch GDD: {e}")
+                        self.gdd_accumulator = []
+
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool
-                if hasattr(self.train_dataset, "on_batch_end"):
+                if hasattr(self.train_dataset, 'on_batch_end'):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)

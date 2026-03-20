@@ -612,3 +612,24 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+
+    # ======================== Difficulty-Aware Advantage Shaping（DAAS）配置 ========================
+    # 适用于 adv_estimator = "grpo_easy_focused" / "grpo_hard_focused" / "grpo_temperature"
+    #
+    # adv_shaping_alpha: easy/hard-focused 的权重系数
+    #   - 对于 easy-focused: g(d) = 1 + α(1-d)
+    #   - 对于 hard-focused: g(d) = 1 + αd
+    #   - α=0 时退化为标准 GRPO
+    adv_shaping_alpha: float = 1.0
+    #
+    # adv_shaping_beta: temperature shaping 的温度系数
+    #   - g(d) = exp(β * d)
+    #   - β>0 → 关注难题, β<0 → 关注简单题, β=0 → 标准 GRPO
+    adv_shaping_beta: float = 1.0
+    #
+    # difficulty_thresholds: [easy_upper, hard_lower]
+    #   - d < easy_upper → easy（如 8 rollout 中 6-8 个正确）
+    #   - d >= hard_lower → hard（如 8 rollout 中 0-2 个正确）
+    #   - 默认 [0.4, 0.7] 对应 group_size=8 时：
+    #     easy: 正确 5-8 个 (d<0.4), medium: 3-4 个, hard: 0-2 个 (d>=0.7)
+    difficulty_thresholds: list[float] = field(default_factory=lambda: [0.4, 0.7])

@@ -330,6 +330,274 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
+###############################################################################
+# Difficulty-Aware Advantage Shaping（毕业论文实验）
+# difficulty 动态计算：根据 group 内正确样本数量划分
+#   group_size=8: 0-2 correct → hard, 3-5 → medium, 6-8 → easy
+# 核心公式: A' = A * g(d)，其中 d = 1 - (correct_count / group_size)
+###############################################################################
+
+
+def _compute_dynamic_difficulty(
+    scores: torch.Tensor,
+    index: np.ndarray,
+    difficulty_thresholds: tuple[float, float] = (0.4, 0.7),
+) -> tuple[dict, dict]:
+    """
+    根据 group 内正确样本数量动态计算 difficulty。
+
+    Args:
+        scores: (bs,) 每个样本的 reward score（通常0/1）
+        index: (bs,) group id（uid）
+        difficulty_thresholds: (easy_upper, hard_lower)
+            d < easy_upper → easy
+            d >= hard_lower → hard
+            otherwise → medium
+
+    Returns:
+        id2difficulty: {uid: difficulty_value}  # d = 1 - correct_rate
+        id2difficulty_label: {uid: "easy"/"medium"/"hard"}
+    """
+    easy_upper, hard_lower = difficulty_thresholds
+
+    # 按 uid 分组收集 score
+    id2scores = defaultdict(list)
+    bsz = scores.shape[0]
+    for i in range(bsz):
+        id2scores[index[i]].append(scores[i])
+
+    id2difficulty = {}
+    id2difficulty_label = {}
+    for uid, group_scores in id2scores.items():
+        group_size = len(group_scores)
+        correct_count = sum(1 for s in group_scores if s.item() > 0.5)
+        difficulty = 1.0 - correct_count / group_size
+        id2difficulty[uid] = difficulty
+
+        if difficulty < easy_upper:
+            id2difficulty_label[uid] = "easy"
+        elif difficulty >= hard_lower:
+            id2difficulty_label[uid] = "hard"
+        else:
+            id2difficulty_label[uid] = "medium"
+
+    return id2difficulty, id2difficulty_label
+
+
+@register_adv_est("grpo_easy_focused")
+def compute_grpo_easy_focused_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Easy-focused advantage shaping: g(d) = 1 + α(1-d)
+    越简单的样本权重越大，促进模型巩固已有能力。
+
+    Args:
+        同 compute_grpo_outcome_advantage
+        config.adv_shaping_alpha: shaping 强度系数（默认 1.0）
+        config.difficulty_thresholds: difficulty 分桶阈值（默认 [0.4, 0.7]）
+    """
+    # 获取 shaping 参数
+    alpha = config.get("adv_shaping_alpha", 1.0) if config else 1.0
+    thresholds = config.get("difficulty_thresholds", [0.4, 0.7]) if config else [0.4, 0.7]
+    thresholds = tuple(thresholds)
+
+    scores = token_level_rewards.sum(dim=-1)
+
+    # 动态计算 difficulty
+    id2difficulty, id2difficulty_label = _compute_dynamic_difficulty(scores, index, thresholds)
+
+    # 标准 GRPO advantage
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        # 计算标准化 advantage 并应用 easy-focused shaping
+        for i in range(bsz):
+            uid = index[i]
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[uid]) / (id2std[uid] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[uid]
+
+            # Easy-focused: g(d) = 1 + α(1-d)，d 越小（越简单），权重越大
+            d = id2difficulty[uid]
+            g_d = 1.0 + alpha * (1.0 - d)
+            scores[i] = scores[i] * g_d
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    # [调试信息] 打印 difficulty 分布
+    n_easy = sum(1 for l in id2difficulty_label.values() if l == "easy")
+    n_medium = sum(1 for l in id2difficulty_label.values() if l == "medium")
+    n_hard = sum(1 for l in id2difficulty_label.values() if l == "hard")
+    print(f"[DAAS-EasyFocused] α={alpha:.2f} | "
+          f"difficulty分布: easy={n_easy}, medium={n_medium}, hard={n_hard} | "
+          f"avg_difficulty={np.mean(list(id2difficulty.values())):.3f}")
+
+    return scores, scores
+
+
+@register_adv_est("grpo_hard_focused")
+def compute_grpo_hard_focused_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Hard-focused advantage shaping: g(d) = 1 + αd
+    越困难的样本权重越大，促进模型探索更难的问题。
+
+    Args:
+        同 compute_grpo_outcome_advantage
+        config.adv_shaping_alpha: shaping 强度系数（默认 1.0）
+        config.difficulty_thresholds: difficulty 分桶阈值（默认 [0.4, 0.7]）
+    """
+    alpha = config.get("adv_shaping_alpha", 1.0) if config else 1.0
+    thresholds = config.get("difficulty_thresholds", [0.4, 0.7]) if config else [0.4, 0.7]
+    thresholds = tuple(thresholds)
+
+    scores = token_level_rewards.sum(dim=-1)
+    id2difficulty, id2difficulty_label = _compute_dynamic_difficulty(scores, index, thresholds)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        for i in range(bsz):
+            uid = index[i]
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[uid]) / (id2std[uid] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[uid]
+
+            # Hard-focused: g(d) = 1 + αd，d 越大（越困难），权重越大
+            d = id2difficulty[uid]
+            g_d = 1.0 + alpha * d
+            scores[i] = scores[i] * g_d
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    n_easy = sum(1 for l in id2difficulty_label.values() if l == "easy")
+    n_medium = sum(1 for l in id2difficulty_label.values() if l == "medium")
+    n_hard = sum(1 for l in id2difficulty_label.values() if l == "hard")
+    print(f"[DAAS-HardFocused] α={alpha:.2f} | "
+          f"difficulty分布: easy={n_easy}, medium={n_medium}, hard={n_hard} | "
+          f"avg_difficulty={np.mean(list(id2difficulty.values())):.3f}")
+
+    return scores, scores
+
+
+@register_adv_est("grpo_temperature")
+def compute_grpo_temperature_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Temperature-based advantage shaping: g(d) = exp(β * d)
+    β > 0 → 关注难题（hard-focused）
+    β < 0 → 关注简单题（easy-focused）
+    β = 0 → 等价于标准 GRPO
+
+    Args:
+        同 compute_grpo_outcome_advantage
+        config.adv_shaping_beta: temperature 系数（默认 1.0）
+        config.difficulty_thresholds: difficulty 分桶阈值（默认 [0.4, 0.7]）
+    """
+    beta = config.get("adv_shaping_beta", 1.0) if config else 1.0
+    thresholds = config.get("difficulty_thresholds", [0.4, 0.7]) if config else [0.4, 0.7]
+    thresholds = tuple(thresholds)
+
+    scores = token_level_rewards.sum(dim=-1)
+    id2difficulty, id2difficulty_label = _compute_dynamic_difficulty(scores, index, thresholds)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        for i in range(bsz):
+            uid = index[i]
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[uid]) / (id2std[uid] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[uid]
+
+            # Temperature shaping: g(d) = exp(β * d)
+            d = id2difficulty[uid]
+            g_d = np.exp(beta * d)
+            scores[i] = scores[i] * g_d
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    n_easy = sum(1 for l in id2difficulty_label.values() if l == "easy")
+    n_medium = sum(1 for l in id2difficulty_label.values() if l == "medium")
+    n_hard = sum(1 for l in id2difficulty_label.values() if l == "hard")
+    avg_g = np.mean([np.exp(beta * d) for d in id2difficulty.values()])
+    print(f"[DAAS-Temperature] β={beta:.2f} | "
+          f"difficulty分布: easy={n_easy}, medium={n_medium}, hard={n_hard} | "
+          f"avg_difficulty={np.mean(list(id2difficulty.values())):.3f} | "
+          f"avg_g(d)={avg_g:.3f}")
+
+    return scores, scores
+
+
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(
     token_level_rewards: torch.Tensor,

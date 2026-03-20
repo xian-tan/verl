@@ -657,3 +657,178 @@ def process_validation_metrics(
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
     return data_src2var2metric2val
+
+
+###############################################################################
+# GDD (Gradient Difficulty Distribution) — Epoch-level 累积统计
+# 用于分析 advantage shaping 如何改变 policy gradient 在不同 difficulty 样本上的分布
+###############################################################################
+
+
+def collect_gdd_samples(batch: DataProto) -> list[dict]:
+    """
+    从当前 batch 中提取 GDD 计算所需的 per-sample 标量信息。
+    设计为极低开销（仅提取标量到 CPU），不影响训练速度。
+
+    提取内容:
+        - uid: 用于后续按 prompt 分组计算 difficulty
+        - score: reward score（用于计算 difficulty = 1 - correct_rate）
+        - abs_adv: |A| 的 token 级别均值（GDD-1 指标）
+        - neg_logp: -logprob 的 token 级别均值
+        - gradient_proxy: |A| * (-logprob)（GDD-2 指标，近似梯度强度）
+
+    Args:
+        batch: DataProto 对象，包含当前 step 的所有训练数据
+
+    Returns:
+        list[dict]: 每个元素是一个样本的标量信息字典
+    """
+    samples = []
+
+    # 获取必要数据
+    uids = batch.non_tensor_batch.get("uid", None)
+    if uids is None:
+        print("[GDD] Warning: no 'uid' in non_tensor_batch, skipping GDD collection.")
+        return samples
+
+    scores = batch.batch["token_level_scores"].sum(-1)  # (bs,) sequence-level score
+    advantages = batch.batch["advantages"]  # (bs, seq_len)
+    response_mask = batch.batch["response_mask"]  # (bs, seq_len)
+
+    # old_log_probs 可能不存在（如在某些配置中）
+    has_log_probs = "old_log_probs" in batch.batch
+    if has_log_probs:
+        old_log_probs = batch.batch["old_log_probs"]  # (bs, seq_len)
+
+    with torch.no_grad():
+        # 计算每个样本的 token-level 平均 |A|
+        mask_sum = response_mask.sum(-1).clamp(min=1)  # (bs,)
+        seq_abs_adv = (advantages.abs() * response_mask).sum(-1) / mask_sum  # (bs,)
+
+        if has_log_probs:
+            seq_neg_logp = (-old_log_probs * response_mask).sum(-1) / mask_sum  # (bs,)
+        else:
+            seq_neg_logp = torch.zeros_like(seq_abs_adv)
+
+    bsz = len(uids)
+    for i in range(bsz):
+        abs_adv_val = seq_abs_adv[i].item()
+        neg_logp_val = seq_neg_logp[i].item()
+        samples.append({
+            "uid": uids[i],
+            "score": scores[i].item(),
+            "abs_adv": abs_adv_val,           # GDD-1 用
+            "neg_logp": neg_logp_val,          # GDD-2 的组成部分
+            "gradient_proxy": abs_adv_val * neg_logp_val,  # GDD-2: |A|*(-logp)
+        })
+
+    return samples
+
+
+def compute_epoch_gdd(
+    accumulator: list[dict],
+    difficulty_thresholds: tuple[float, float] = (0.4, 0.7),
+) -> dict[str, float]:
+    """
+    在整个 epoch 数据上计算 GDD (Gradient Difficulty Distribution) 指标。
+
+    核心逻辑:
+        1. 按 uid 分组，统计每个 prompt 的 correct_count
+        2. 计算 difficulty = 1 - (correct_count / group_size)
+        3. 按 difficulty 分桶 (easy/medium/hard)
+        4. 计算 GDD-1: E[|A| | bucket] 和 GDD-2: E[|A|*(-logp) | bucket]
+
+    为什么需要 epoch-level:
+        - 单个 batch 内同一难度桶的样本太少，统计量噪音大
+        - epoch-level 累积后每个桶有足够样本，统计可靠
+
+    Args:
+        accumulator: list[dict]，每个 dict 包含 uid, score, abs_adv, neg_logp, gradient_proxy
+        difficulty_thresholds: (easy_upper, hard_lower)
+
+    Returns:
+        dict[str, float]: GDD 指标，以 "gdd/epoch/" 为前缀
+    """
+    if len(accumulator) == 0:
+        return {}
+
+    easy_upper, hard_lower = difficulty_thresholds
+
+    # Step 1: 按 uid 分组
+    uid_to_samples = defaultdict(list)
+    for s in accumulator:
+        uid_to_samples[s["uid"]].append(s)
+
+    # Step 2: 对每个 prompt（uid），计算 difficulty
+    for uid, group_samples in uid_to_samples.items():
+        correct_count = sum(1 for s in group_samples if s["score"] > 0.5)
+        group_size = len(group_samples)
+        difficulty = 1.0 - correct_count / group_size
+
+        # 回写 difficulty 到每个样本
+        for s in group_samples:
+            s["difficulty"] = difficulty
+
+    # 展平
+    all_samples = [s for group in uid_to_samples.values() for s in group]
+
+    # Step 3: 按 difficulty bucket 聚合
+    buckets = {"easy": [], "medium": [], "hard": []}
+    for s in all_samples:
+        d = s["difficulty"]
+        if d < easy_upper:
+            buckets["easy"].append(s)
+        elif d >= hard_lower:
+            buckets["hard"].append(s)
+        else:
+            buckets["medium"].append(s)
+
+    # Step 4: 计算 GDD 指标
+    metrics = {}
+    total_samples = len(all_samples)
+
+    for name, samples in buckets.items():
+        n = len(samples)
+        metrics[f"gdd/epoch/{name}/count"] = float(n)
+        if n > 0:
+            # GDD-1: E[|A| | bucket]
+            metrics[f"gdd/epoch/{name}/gdd1_avg_abs_adv"] = float(np.mean([s["abs_adv"] for s in samples]))
+            # GDD-2: E[|A|*(-logp) | bucket]
+            metrics[f"gdd/epoch/{name}/gdd2_avg_gradient_proxy"] = float(
+                np.mean([s["gradient_proxy"] for s in samples])
+            )
+            # 辅助指标
+            metrics[f"gdd/epoch/{name}/avg_score"] = float(np.mean([s["score"] for s in samples]))
+            metrics[f"gdd/epoch/{name}/avg_difficulty"] = float(np.mean([s["difficulty"] for s in samples]))
+            metrics[f"gdd/epoch/{name}/avg_neg_logp"] = float(np.mean([s["neg_logp"] for s in samples]))
+        else:
+            metrics[f"gdd/epoch/{name}/gdd1_avg_abs_adv"] = 0.0
+            metrics[f"gdd/epoch/{name}/gdd2_avg_gradient_proxy"] = 0.0
+            metrics[f"gdd/epoch/{name}/avg_score"] = 0.0
+            metrics[f"gdd/epoch/{name}/avg_difficulty"] = 0.0
+            metrics[f"gdd/epoch/{name}/avg_neg_logp"] = 0.0
+
+    # 全局难度分布统计
+    all_diffs = [s["difficulty"] for s in all_samples]
+    metrics["gdd/epoch/difficulty_mean"] = float(np.mean(all_diffs))
+    metrics["gdd/epoch/difficulty_std"] = float(np.std(all_diffs))
+    metrics["gdd/epoch/easy_ratio"] = len(buckets["easy"]) / total_samples if total_samples > 0 else 0.0
+    metrics["gdd/epoch/medium_ratio"] = len(buckets["medium"]) / total_samples if total_samples > 0 else 0.0
+    metrics["gdd/epoch/hard_ratio"] = len(buckets["hard"]) / total_samples if total_samples > 0 else 0.0
+
+    # 全局平均指标（不分桶）
+    metrics["gdd/epoch/global_gdd1_avg_abs_adv"] = float(np.mean([s["abs_adv"] for s in all_samples]))
+    metrics["gdd/epoch/global_gdd2_avg_gradient_proxy"] = float(
+        np.mean([s["gradient_proxy"] for s in all_samples])
+    )
+
+    # 每个 prompt 的统计（用于分析 difficulty 分布）
+    n_prompts = len(uid_to_samples)
+    prompt_difficulties = []
+    for uid, group in uid_to_samples.items():
+        prompt_difficulties.append(group[0]["difficulty"])
+    metrics["gdd/epoch/n_prompts"] = float(n_prompts)
+    metrics["gdd/epoch/prompt_difficulty_mean"] = float(np.mean(prompt_difficulties))
+    metrics["gdd/epoch/prompt_difficulty_std"] = float(np.std(prompt_difficulties))
+
+    return metrics
